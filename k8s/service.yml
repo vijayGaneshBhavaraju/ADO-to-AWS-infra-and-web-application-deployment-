@@ -1,0 +1,17 @@
+
+#Service file lo type: LoadBalancer kabatti cluster baiti nundi direct ga access cheyyadaniki public IP create avutundi. 
+#Service 80 port lo request teesukoni internal ga pod’s 8080 ki forward chestundi.
+#Selector and labels match avvali ante app: aksdeployment rendu places lo same ga vundali — nii YAML lo correct ga unnayi.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: aksdeployment-svc
+spec:
+  type: LoadBalancer
+  selector:
+    app: aksdeployment
+  ports:
+  - port: 80
+    targetPort: 8080
+

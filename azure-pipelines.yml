@@ -1,0 +1,174 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  awsRegion: 'us-east-1'
+  awsAccountId: '426628337704'
+  awsServiceConnection: 'aws_ado_Services'
+  ecrName: 'ado-terraform-ecr'
+  # Terraform backend
+  backendBucket: 'ado-tf-backend-vganesh-29032026'
+  backendKey: 'ado.aws.terraform.tfstate'
+  dynamoTable: 'ado-tf-lock-vganesh'
+  imageTag: '$(Build.BuildId)'
+  eksClusterName: 'vijay-eks-cluster'
+  aws.rolecredential.maxduration: '3600'
+
+stages:
+########################################
+# STAGE 1 – TERRAFORM
+########################################
+- stage: Terraform
+  jobs:
+  - job: DeployInfra
+    displayName: Deploy Infra via Terraform
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.6.6'
+
+    - task: AWSShellScript@1
+      displayName: 'Terraform Init'
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          cd Terraform
+          # Cleaning old cache to prevent 'Unsupported Argument' errors
+          rm -rf .terraform
+          rm -rf .terraform.lock.hcl
+          
+          terraform init -upgrade \
+            -backend-config="bucket=$(backendBucket)" \
+            -backend-config="key=$(backendKey)" \
+            -backend-config="region=$(awsRegion)" \
+            -backend-config="dynamodb_table=$(dynamoTable)" \
+            -backend-config="encrypt=true"
+
+    - task: AWSShellScript@1
+      displayName: 'Terraform Plan'
+      timeoutInMinutes: 60
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          cd Terraform
+          terraform plan -var-file="terraform.tfvars"
+
+    # - task: AWSShellScript@1
+    #   displayName: 'Terraform Destroy Old Infra'
+    #   inputs:
+    #     awsCredentials: '$(awsServiceConnection)'
+    #     regionName: '$(awsRegion)'
+    #     scriptType: 'inline'
+    #     inlineScript: |
+    #       set -e
+    #       cd Terraform
+    #       terraform init \
+    #         -backend-config="bucket=$(backendBucket)" \
+    #         -backend-config="key=$(backendKey)" \
+    #         -backend-config="region=$(awsRegion)" \
+    #         -backend-config="dynamodb_table=$(dynamoTable)" \
+    #         -backend-config="encrypt=true"
+    #       terraform destroy -auto-approve -var-file="terraform.tfvars" || true
+          
+    - task: AWSShellScript@1
+      displayName: 'Terraform Apply'
+      timeoutInMinutes: 60
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          cd Terraform
+          terraform apply -auto-approve -var-file="terraform.tfvars"
+
+########################################
+# STAGE 2 – BUILD & PUSH IMAGE TO ECR
+########################################
+- stage: Build_Push_ECR
+  dependsOn: Terraform
+  jobs:
+  - job: BuildPush
+    displayName: Build and Push Docker Image
+    steps:
+    - checkout: self
+
+    - task: AWSShellScript@1
+      displayName: 'Login to ECR'
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          aws ecr get-login-password --region $(awsRegion) | docker login --username AWS --password-stdin $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com
+
+    - script: |
+        set -e
+        IMAGE=$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):$(imageTag)
+        echo "Building Docker image..."
+        docker build -t $IMAGE .
+        echo "Tagging latest..."
+        docker tag $IMAGE $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):latest
+        echo "Pushing image..."
+        docker push $IMAGE
+        docker push $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):latest
+      displayName: Build and Push Image
+
+########################################
+# STAGE 3 – DEPLOY TO EKS
+########################################
+- stage: Deploy_EKS
+  dependsOn: Build_Push_ECR
+  jobs:
+  - job: Deploy
+    displayName: Deploy to EKS
+    steps:
+    - checkout: self
+
+    - task: AWSShellScript@1
+      displayName: 'Install kubectl'
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+    - task: AWSShellScript@1
+      displayName: 'Configure kubeconfig'
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          aws eks update-kubeconfig --region $(awsRegion) --name $(eksClusterName)
+          kubectl get nodes
+
+    - task: AWSShellScript@1
+      displayName: 'Deploy Application'
+      inputs:
+        awsCredentials: '$(awsServiceConnection)'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          set -e
+          IMAGE=$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):$(imageTag)
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|g" k8s/deployment.yml
+          kubectl apply -f k8s/deployment.yml
+          kubectl apply -f k8s/service.yml
+          kubectl rollout status deployment -l app=$(ecrName) --timeout=5m

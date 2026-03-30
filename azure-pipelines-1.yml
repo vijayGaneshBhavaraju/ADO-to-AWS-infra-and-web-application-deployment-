@@ -1,0 +1,19 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: OIDC_Test
+  jobs:
+  - job: TestAWSOIDC
+    steps:
+    - task: AWSShellScript@1
+      displayName: 'Test OIDC Authentication'
+      inputs:
+        awsCredentials: 'aws_ado_Services'
+        regionName: 'ap-south-1'
+        scriptType: 'inline'
+        inlineScript: |
+          echo "Testing AWS identity..."
+          aws sts get-caller-identity

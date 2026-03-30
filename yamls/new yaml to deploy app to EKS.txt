@@ -1,0 +1,125 @@
+trigger:
+- none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  awsRegion: 'ap-south-1'
+  ecrName: 'ado-terraform-ecr'
+  backendBucket: 'vijaybhavaraju-tf-backend-demo'
+  backendKey: 'dev/terraform.tfstate'
+  dynamoTable: 'vijayb-tf-lock-demo'
+  aws.rolecredential.maxduration: '28800'
+  imageTag: '$(Build.BuildId)'
+  awsAccountId: '<YOUR_AWS_ACCOUNT_ID>'
+  eksClusterName: '<YOUR_EKS_CLUSTER_NAME>'
+
+########################################
+# STAGE 1 – TERRAFORM (DO NOT TOUCH)
+########################################
+stages:
+- stage: Terraform
+  jobs:
+  - job: DeployECR
+    displayName: Deploy ECR via Terraform
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.6.6'
+
+    - task: AWSShellScript@1
+      displayName: 'Terraform Init'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          terraform init \
+            -backend-config="bucket=$(backendBucket)" \
+            -backend-config="key=$(backendKey)" \
+            -backend-config="region=$(awsRegion)" \
+            -backend-config="dynamodb_table=$(dynamoTable)" \
+            -backend-config="encrypt=true"
+
+    - task: AWSShellScript@1
+      displayName: 'Terraform Plan'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          terraform plan -var-file="terraform.tfvars"
+
+    - task: AWSShellScript@1
+      displayName: 'Terraform Apply'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          terraform apply -auto-approve -var-file="terraform.tfvars"
+
+########################################
+# STAGE 2 – BUILD & PUSH IMAGE TO ECR
+########################################
+- stage: Build_Push_ECR
+  dependsOn: Terraform
+  jobs:
+  - job: BuildPush
+    displayName: Build and Push Docker Image to ECR
+    steps:
+    - checkout: self
+
+    - task: AWSShellScript@1
+      displayName: 'Login to Amazon ECR'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          aws ecr get-login-password --region $(awsRegion) \
+          | docker login --username AWS \
+            --password-stdin $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com
+
+    - script: |
+        docker build -t $(ecrName):$(imageTag) .
+        docker tag $(ecrName):$(imageTag) \
+          $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):$(imageTag)
+        docker push \
+          $(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):$(imageTag)
+      displayName: Build and Push Image
+
+########################################
+# STAGE 3 – DEPLOY TO EKS
+########################################
+- stage: Deploy_EKS
+  dependsOn: Build_Push_ECR
+  jobs:
+  - job: Deploy
+    displayName: Deploy ASP.NET Core App to EKS
+    steps:
+    - checkout: self
+
+    - task: AWSShellScript@1
+      displayName: 'Configure kubeconfig for EKS'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          aws eks update-kubeconfig \
+            --region $(awsRegion) \
+            --name $(eksClusterName)
+
+    - script: |
+        sed -i "s|IMAGE_PLACEHOLDER|$(awsAccountId).dkr.ecr.$(awsRegion).amazonaws.com/$(ecrName):$(imageTag)|g" k8s/deployment.yml
+        kubectl apply -f k8s/deployment.yml
+        kubectl apply -f k8s/service.yml
+      displayName: Deploy to EKS
+``

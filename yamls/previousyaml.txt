@@ -1,0 +1,64 @@
+trigger:
+- none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  awsRegion: 'ap-south-1'
+  ecrName: 'ado-terraform-ecr'
+  backendBucket: 'vijaybhavaraju-tf-backend-demo'
+  backendKey: 'dev/terraform.tfstate'
+  dynamoTable: 'vijayb-tf-lock-demo'
+  aws.rolecredential.maxduration: '28800'
+
+stages:
+- stage: Terraform
+  jobs:
+  - job: DeployECR
+    displayName: Deploy ECR via Terraform
+    steps:
+    - checkout: self
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: '1.6.6'
+
+    # 1. Terraform Init
+    - task: AWSShellScript@1
+      displayName: 'Terraform Init'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          terraform init \
+            -backend-config="bucket=$(backendBucket)" \
+            -backend-config="key=$(backendKey)" \
+            -backend-config="region=$(awsRegion)" \
+            -backend-config="dynamodb_table=$(dynamoTable)" \
+            -backend-config="encrypt=true"
+
+    # 2. Terraform Plan
+    - task: AWSShellScript@1
+      displayName: 'Terraform Plan'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          # Use ONLY the var-file since it already has your variables
+          terraform plan -var-file="terraform.tfvars"
+
+    # 3. Terraform Apply
+    - task: AWSShellScript@1
+      displayName: 'Terraform Apply'
+      inputs:
+        awsCredentials: 'Vijay-AWS'
+        regionName: '$(awsRegion)'
+        scriptType: 'inline'
+        inlineScript: |
+          cd Terraform
+          terraform apply -auto-approve -var-file="terraform.tfvars"
